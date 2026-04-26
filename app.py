@@ -7,8 +7,8 @@ st.write("输入你喜欢的书，找到相似的好书！")
 
 @st.cache_data
 def load_data():
-    books = pd.read_csv('D:/book_project/Books.csv', low_memory=False)
-    ratings = pd.read_csv('D:/book_project/Ratings.csv')
+    books = pd.read_csv('Books.csv', low_memory=False)
+    ratings = pd.read_csv('Ratings.csv')
     books_clean = books.dropna(subset=['Book-Author', 'Publisher'])
     ratings_clean = ratings[ratings['Book-Rating'] > 0]
     book_counts = ratings_clean.groupby('ISBN')['Book-Rating'].count()
