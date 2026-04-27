@@ -145,8 +145,10 @@ def _parse_google_items(items):
 
 def _search_google(query, max_results=20):
     url = "https://www.googleapis.com/books/v1/volumes"
-    # 不加 langRestrict，避免美国服务器上过滤掉中文书
     params = {"q": query, "maxResults": max_results, "printType": "books"}
+    api_key = st.secrets.get("GOOGLE_BOOKS_API_KEY", "")
+    if api_key:
+        params["key"] = api_key
     resp = requests.get(url, params=params, timeout=10)
     resp.raise_for_status()
     return _parse_google_items(resp.json().get("items", []))
