@@ -3,7 +3,7 @@ import pandas as pd
 from sklearn.metrics.pairwise import cosine_similarity
 
 st.title("📚 书籍推荐系统")
-st.write("输入你喜欢的书，找到相似的好书！")
+st.write("输入书名关键词，找到相似的好书！")
 
 @st.cache_data
 def load_data():
@@ -30,20 +30,41 @@ def load_data():
 
 books_clean, book_sim_df = load_data()
 
-book_input = st.text_input("输入书名（英文）", placeholder="例如：Sorcerer's Stone")
+# 搜索框
+keyword = st.text_input("输入书名关键词（中英文均可）", placeholder="例如：魔法、Harry、Lord")
 
-if book_input:
-    matched = books_clean[books_clean['Book-Title'].str.contains(book_input, case=False, na=False)]
+if keyword:
+    # 翻译常见中文关键词
+    zh_map = {
+        "魔法": "magic", "哈利": "harry", "波特": "potter",
+        "魔戒": "ring", "指环王": "ring", "小王子": "little prince",
+        "夏洛": "charlotte", "纳尼亚": "narnia", "福尔摩斯": "holmes",
+        "侦探": "detective", "爱情": "love", "战争": "war",
+        "历史": "history", "科幻": "science", "奇幻": "fantasy"
+    }
+    search_word = keyword.lower()
+    for zh, en in zh_map.items():
+        if zh in keyword:
+            search_word = en
+            break
+
+    # 模糊匹配书名
+    matched = books_clean[books_clean['Book-Title'].str.contains(search_word, case=False, na=False)]
+
     if matched.empty:
-        st.error("找不到这本书，请换个关键词试试")
+        st.error("没有找到相关书籍，试试其他关键词")
     else:
-        isbn = matched.iloc[0]['ISBN']
-        title = matched.iloc[0]['Book-Title']
-        if isbn not in book_sim_df.columns:
-            st.warning(f"《{title}》数据不足，无法推荐")
-        else:
-            similar = book_sim_df[isbn].sort_values(ascending=False)[1:6]
-            result = books_clean[books_clean['ISBN'].isin(similar.index)]
-            st.success(f"因为你喜欢《{title}》，推荐你看：")
-            for _, row in result.iterrows():
-                st.write(f"📖 **{row['Book-Title']}** — {row['Book-Author']}")
+        # 显示下拉选择框
+        options = matched['Book-Title'].tolist()[:20]
+        selected = st.selectbox("选择一本书：", options)
+
+        if selected:
+            isbn = matched[matched['Book-Title'] == selected].iloc[0]['ISBN']
+            if isbn not in book_sim_df.columns:
+                st.warning(f"《{selected}》数据不足，无法推荐")
+            else:
+                similar = book_sim_df[isbn].sort_values(ascending=False)[1:6]
+                result = books_clean[books_clean['ISBN'].isin(similar.index)]
+                st.success(f"因为你喜欢《{selected}》，推荐你看：")
+                for _, row in result.iterrows():
+                    st.write(f"📖 **{row['Book-Title']}** — {row['Book-Author']}")
