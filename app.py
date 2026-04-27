@@ -7,6 +7,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import TfidfVectorizer
 import os
 import pickle
+import requests
 
 
 class NCF(nn.Module):
@@ -23,6 +24,7 @@ class NCF(nn.Module):
     def forward(self, user, book):
         x = torch.cat([self.user_emb(user), self.book_emb(book)], dim=1)
         return self.fc(x).squeeze()
+
 
 st.set_page_config(page_title="书荒救星", page_icon="📚", layout="wide")
 
@@ -41,7 +43,10 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("📚 书荒救星 - 智能图书推荐")
-st.markdown("### 🎯 根据你的口味，找到下一本好书")
+st.markdown("### 🎯 中英文书籍一站搜索，找到下一本好书")
+
+
+# ── 数据加载 ──────────────────────────────────────────────────────────────────
 
 @st.cache_data
 def load_data():
@@ -50,14 +55,13 @@ def load_data():
     books_clean = books.dropna(subset=['Book-Author', 'Publisher'])
     ratings_clean = ratings[ratings['Book-Rating'] > 0]
 
-    # 计算平均评分
-    avg_ratings = ratings_clean.groupby('ISBN').agg({
-        'Book-Rating': ['mean', 'count']
-    }).reset_index()
-    avg_ratings.columns = ['ISBN', 'avg_rating', 'rating_count']
+    avg_ratings = ratings_clean.groupby('ISBN').agg(
+        avg_rating=('Book-Rating', 'mean'),
+        rating_count=('Book-Rating', 'count')
+    ).reset_index()
     books_clean = books_clean.merge(avg_ratings, on='ISBN', how='left')
 
-    # 协同过滤
+    # 协同过滤矩阵
     book_counts = ratings_clean.groupby('ISBN')['Book-Rating'].count()
     popular_isbns = book_counts[book_counts >= 20].index
     ratings_popular = ratings_clean[ratings_clean['ISBN'].isin(popular_isbns)]
@@ -67,25 +71,26 @@ def load_data():
     book_matrix = ratings_filtered.pivot_table(
         index='User-ID', columns='ISBN', values='Book-Rating'
     ).fillna(0)
-    book_similarity = cosine_similarity(book_matrix.T)
     book_sim_df = pd.DataFrame(
-        book_similarity,
+        cosine_similarity(book_matrix.T),
         index=book_matrix.columns,
         columns=book_matrix.columns
     )
 
-    # 基于内容的相似度（作者+出版社）- 只对有足够评分的书计算，避免OOM
+    # 内容相似度（top-K 邻居，避免 OOM）
     content_books = books_clean[books_clean['rating_count'] >= 5].reset_index(drop=True)
-    content_books['content'] = content_books['Book-Author'].fillna('') + ' ' + content_books['Publisher'].fillna('')
+    content_books['content'] = (
+        content_books['Book-Author'].fillna('') + ' ' +
+        content_books['Publisher'].fillna('')
+    )
     tfidf = TfidfVectorizer(max_features=500)
     content_matrix = tfidf.fit_transform(content_books['content'])
 
-    # 只存 top-K 邻居，避免存储完整 NxN 矩阵（271356^2 = 589GB）
     K = 50
     isbn_arr = content_books['ISBN'].values
     top_k_neighbors = {}
-    n = len(content_books)
     batch_size = 500
+    n = len(content_books)
     for start in range(0, n, batch_size):
         end = min(start + batch_size, n)
         sims = cosine_similarity(content_matrix[start:end], content_matrix)
@@ -98,6 +103,7 @@ def load_data():
 
     return books_clean, book_sim_df, top_k_neighbors, tfidf, content_matrix, content_books, ratings_clean
 
+
 @st.cache_resource
 def load_dl_model():
     if os.path.exists('book_model.pt') and os.path.exists('mappings.pkl'):
@@ -109,14 +115,71 @@ def load_dl_model():
         return model, mappings
     return None, None
 
+
 books_clean, book_sim_df, top_k_neighbors, tfidf, content_matrix, content_books, ratings_clean = load_data()
 dl_model, mappings = load_dl_model()
 
+
+# ── Google Books API（中文书核心入口）────────────────────────────────────────
+
+def search_google_books(query, max_results=20):
+    """搜索 Google Books，返回标准化 DataFrame（与英文库字段对齐）。"""
+    try:
+        url = "https://www.googleapis.com/books/v1/volumes"
+        params = {"q": query, "maxResults": max_results, "langRestrict": "zh"}
+        resp = requests.get(url, params=params, timeout=8)
+        resp.raise_for_status()
+        items = resp.json().get("items", [])
+    except Exception:
+        return pd.DataFrame()
+
+    rows = []
+    for item in items:
+        info = item.get("volumeInfo", {})
+        img = info.get("imageLinks", {})
+        rows.append({
+            "ISBN": item.get("id", ""),
+            "Book-Title": info.get("title", ""),
+            "Book-Author": "、".join(info.get("authors", ["未知作者"])),
+            "Publisher": info.get("publisher", ""),
+            "Year-Of-Publication": str(info.get("publishedDate", ""))[:4],
+            "Image-URL-M": img.get("thumbnail", img.get("smallThumbnail", "")),
+            "avg_rating": info.get("averageRating", None),
+            "rating_count": info.get("ratingsCount", 0),
+            "source": "中文书库",
+            "description": info.get("description", ""),
+            "categories": "、".join(info.get("categories", [])),
+        })
+    return pd.DataFrame(rows)
+
+
+def get_google_books_recommendations(title, author, categories, num=10):
+    """基于书的标题/作者/分类，从 Google Books 找相似中文书。"""
+    results = pd.DataFrame()
+
+    # 先按分类搜
+    if categories:
+        cat = categories.split("、")[0]
+        df = search_google_books(cat, max_results=15)
+        results = pd.concat([results, df], ignore_index=True)
+
+    # 再按作者搜
+    if author and author != "未知作者":
+        df = search_google_books(author, max_results=10)
+        results = pd.concat([results, df], ignore_index=True)
+
+    # 去掉自身
+    if not results.empty:
+        results = results[results['Book-Title'] != title].drop_duplicates(subset='ISBN')
+
+    return results.head(num)
+
+
+# ── 英文书内容邻居 ────────────────────────────────────────────────────────────
+
 def get_content_neighbors(isbn, num):
-    """返回基于内容相似度的邻居 ISBN 列表。"""
     if isbn in top_k_neighbors:
         return top_k_neighbors[isbn][:num]
-    # 对不在预计算集合中的书，实时计算（<2ms）
     row = books_clean[books_clean['ISBN'] == isbn]
     if row.empty:
         return []
@@ -126,7 +189,9 @@ def get_content_neighbors(isbn, num):
     top_idx = np.argsort(sims)[::-1][:num]
     return content_books.iloc[top_idx]['ISBN'].tolist()
 
-# 侧边栏 - 个性化选项
+
+# ── 侧边栏 ────────────────────────────────────────────────────────────────────
+
 with st.sidebar:
     st.header("🎨 个性化设置")
 
@@ -139,158 +204,221 @@ with st.sidebar:
 
     rec_method = st.radio("推荐方式", methods, help="混合推荐结合多种算法，效果最佳")
     num_recs = st.slider("推荐数量", 3, 10, 5)
-    min_rating = st.slider("最低评分", 0.0, 10.0, 6.0, 0.5)
+    min_rating = st.slider("最低评分", 0.0, 10.0, 6.0, 0.5,
+                           help="中文书评分数据较少，建议设为 0 以显示更多结果")
 
-# 主搜索区
+
+# ── 主搜索区 ──────────────────────────────────────────────────────────────────
+
 col1, col2 = st.columns([3, 1])
 with col1:
     keyword = st.text_input(
         "🔍 搜索书籍",
-        placeholder="输入书名、作者或关键词（中英文均可）",
-        help="支持模糊搜索，例如：哈利、Potter、魔法"
+        placeholder="支持中英文：哈利波特 / Harry Potter / 明朝那些事",
     )
 with col2:
     st.write("")
     st.write("")
     search_in = st.selectbox("搜索范围", ["书名", "作者", "全部"])
 
-# 中英文关键词映射
-zh_map = {
-    "魔法": "magic", "哈利": "harry", "波特": "potter", "魔戒": "ring",
-    "指环王": "lord ring", "小王子": "little prince", "夏洛": "charlotte",
-    "纳尼亚": "narnia", "福尔摩斯": "holmes sherlock", "侦探": "detective mystery",
-    "爱情": "love romance", "战争": "war", "历史": "history", "科幻": "science fiction",
-    "奇幻": "fantasy", "悬疑": "mystery thriller", "恐怖": "horror", "传记": "biography"
-}
+
+def is_chinese(text):
+    return any('一' <= ch <= '鿿' for ch in text)
+
 
 if keyword:
-    search_word = keyword.lower()
-    for zh, en in zh_map.items():
-        if zh in keyword:
-            search_word += " " + en
+    keyword_stripped = keyword.strip()
 
-    # 根据搜索范围匹配
-    if search_in == "书名":
-        matched = books_clean[books_clean['Book-Title'].str.contains(search_word, case=False, na=False)]
-    elif search_in == "作者":
-        matched = books_clean[books_clean['Book-Author'].str.contains(search_word, case=False, na=False)]
-    else:
-        matched = books_clean[
-            books_clean['Book-Title'].str.contains(search_word, case=False, na=False) |
-            books_clean['Book-Author'].str.contains(search_word, case=False, na=False)
-        ]
+    # ── 判断是中文还是英文搜索 ────────────────────────────────────────────────
+    if is_chinese(keyword_stripped):
+        # 中文：直接走 Google Books API
+        with st.spinner("🔍 正在搜索中文书库..."):
+            matched_cn = search_google_books(keyword_stripped, max_results=20)
 
-    if matched.empty:
-        st.error("😢 没有找到相关书籍，试试其他关键词或更换搜索范围")
-    else:
-        st.success(f"找到 {len(matched)} 本相关书籍")
-        options = matched.nlargest(20, 'rating_count', keep='first')['Book-Title'].tolist()
-        selected = st.selectbox("📖 选择一本你喜欢的书：", options)
+        if matched_cn.empty:
+            st.error("😢 没有找到相关中文书籍，试试其他关键词")
+        else:
+            st.success(f"在中文书库找到 {len(matched_cn)} 本相关书籍")
+            options = matched_cn['Book-Title'].tolist()
+            selected = st.selectbox("📖 选择一本你喜欢的书：", options)
 
-        if selected:
-            book_row = matched[matched['Book-Title'] == selected].iloc[0]
-            isbn = book_row['ISBN']
+            if selected:
+                book_row = matched_cn[matched_cn['Book-Title'] == selected].iloc[0]
 
-            # 显示选中的书籍信息
-            st.markdown("---")
-            col1, col2 = st.columns([1, 3])
-            with col1:
-                if pd.notna(book_row['Image-URL-M']):
-                    st.image(book_row['Image-URL-M'], width=150)
-            with col2:
-                st.markdown(f"### {book_row['Book-Title']}")
-                st.write(f"**作者:** {book_row['Book-Author']}")
-                st.write(f"**出版社:** {book_row['Publisher']}")
-                if pd.notna(book_row['avg_rating']):
-                    st.write(f"**平均评分:** ⭐ {book_row['avg_rating']:.1f}/10 ({int(book_row['rating_count'])} 人评价)")
+                st.markdown("---")
+                col1, col2 = st.columns([1, 3])
+                with col1:
+                    if book_row['Image-URL-M']:
+                        st.image(book_row['Image-URL-M'], width=150)
+                with col2:
+                    st.markdown(f"### {book_row['Book-Title']}")
+                    st.write(f"**作者:** {book_row['Book-Author']}")
+                    if book_row['Publisher']:
+                        st.write(f"**出版社:** {book_row['Publisher']}")
+                    if book_row['avg_rating']:
+                        st.write(f"**评分:** ⭐ {book_row['avg_rating']:.1f}/10 ({int(book_row['rating_count'])} 人评价)")
+                    if book_row['description']:
+                        st.write(f"**简介:** {book_row['description'][:200]}...")
 
-            st.markdown("---")
-            st.markdown(f"### 🎁 因为你喜欢《{selected}》，为你推荐：")
+                st.markdown("---")
+                st.markdown(f"### 🎁 因为你喜欢《{selected}》，为你推荐：")
 
-            # 推荐逻辑
-            recommendations = []
+                with st.spinner("正在生成推荐..."):
+                    recommendations = get_google_books_recommendations(
+                        title=book_row['Book-Title'],
+                        author=book_row['Book-Author'],
+                        categories=book_row['categories'],
+                        num=num_recs
+                    )
 
-            if rec_method == "🤖 深度学习推荐" and dl_model is not None:
-                if isbn not in mappings['book_to_idx']:
-                    st.warning("😅 该书不在深度学习训练集中，已切换为混合推荐")
-                    rec_method = "混合推荐（推荐）"
+                if recommendations.empty:
+                    st.warning("😅 暂时没有找到相似书籍，试试更换搜索词")
                 else:
-                    raters = ratings_clean[
-                        (ratings_clean['ISBN'] == isbn) & (ratings_clean['Book-Rating'] >= 7)
-                    ]['User-ID'].values
-                    valid_users = [u for u in raters[:50] if u in mappings['user_to_idx']]
-                    candidate_isbns = [b for b in list(book_sim_df.columns[:500]) if b != isbn and b in mappings['book_to_idx']]
+                    for _, row in recommendations.iterrows():
+                        col1, col2 = st.columns([1, 4])
+                        with col1:
+                            if row['Image-URL-M']:
+                                st.image(row['Image-URL-M'], width=100)
+                        with col2:
+                            st.markdown(f"#### 📖 {row['Book-Title']}")
+                            st.write(f"**作者:** {row['Book-Author']}")
+                            if row['avg_rating']:
+                                st.write(f"⭐ {row['avg_rating']:.1f}/10")
+                            if row['description']:
+                                st.write(f"{row['description'][:120]}...")
+                        st.markdown("---")
 
-                    if valid_users and candidate_isbns:
-                        u_idxs, b_idxs, b_isbns = [], [], []
-                        for b_isbn in candidate_isbns:
-                            b_idx = mappings['book_to_idx'][b_isbn]
-                            for u in valid_users:
-                                u_idxs.append(mappings['user_to_idx'][u])
-                                b_idxs.append(b_idx)
-                                b_isbns.append(b_isbn)
+    else:
+        # 英文：走原有 Book-Crossing 数据集
+        search_word = keyword_stripped.lower()
 
-                        with torch.no_grad():
-                            preds = dl_model(torch.LongTensor(u_idxs), torch.LongTensor(b_idxs)).numpy()
+        if search_in == "书名":
+            matched = books_clean[books_clean['Book-Title'].str.contains(search_word, case=False, na=False)]
+        elif search_in == "作者":
+            matched = books_clean[books_clean['Book-Author'].str.contains(search_word, case=False, na=False)]
+        else:
+            matched = books_clean[
+                books_clean['Book-Title'].str.contains(search_word, case=False, na=False) |
+                books_clean['Book-Author'].str.contains(search_word, case=False, na=False)
+            ]
 
-                        scores = pd.DataFrame({'isbn': b_isbns, 'score': preds}) \
-                            .groupby('isbn')['score'].mean().sort_values(ascending=False)
-                        recommendations = books_clean[books_clean['ISBN'].isin(scores.head(num_recs * 2).index)]
-                    else:
-                        st.warning("😅 没有足够的用户数据，已切换为混合推荐")
+        if matched.empty:
+            st.error("😢 没有找到相关书籍，试试其他关键词或更换搜索范围")
+        else:
+            st.success(f"找到 {len(matched)} 本相关书籍")
+            options = matched.nlargest(20, 'rating_count', keep='first')['Book-Title'].tolist()
+            selected = st.selectbox("📖 选择一本你喜欢的书：", options)
+
+            if selected:
+                book_row = matched[matched['Book-Title'] == selected].iloc[0]
+                isbn = book_row['ISBN']
+
+                st.markdown("---")
+                col1, col2 = st.columns([1, 3])
+                with col1:
+                    if pd.notna(book_row['Image-URL-M']):
+                        st.image(book_row['Image-URL-M'], width=150)
+                with col2:
+                    st.markdown(f"### {book_row['Book-Title']}")
+                    st.write(f"**作者:** {book_row['Book-Author']}")
+                    st.write(f"**出版社:** {book_row['Publisher']}")
+                    if pd.notna(book_row['avg_rating']):
+                        st.write(f"**平均评分:** ⭐ {book_row['avg_rating']:.1f}/10 ({int(book_row['rating_count'])} 人评价)")
+
+                st.markdown("---")
+                st.markdown(f"### 🎁 因为你喜欢《{selected}》，为你推荐：")
+
+                recommendations = []
+
+                if rec_method == "🤖 深度学习推荐" and dl_model is not None:
+                    if isbn not in mappings['book_to_idx']:
+                        st.warning("😅 该书不在深度学习训练集中，已切换为混合推荐")
                         rec_method = "混合推荐（推荐）"
+                    else:
+                        raters = ratings_clean[
+                            (ratings_clean['ISBN'] == isbn) & (ratings_clean['Book-Rating'] >= 7)
+                        ]['User-ID'].values
+                        valid_users = [u for u in raters[:50] if u in mappings['user_to_idx']]
+                        candidate_isbns = [b for b in list(book_sim_df.columns[:500])
+                                           if b != isbn and b in mappings['book_to_idx']]
 
-            if rec_method == "基于用户评分" and isbn in book_sim_df.columns:
-                similar = book_sim_df[isbn].sort_values(ascending=False)[1:num_recs+1]
-                recommendations = books_clean[books_clean['ISBN'].isin(similar.index)]
-            elif rec_method == "基于作者风格":
-                neighbor_isbns = get_content_neighbors(isbn, num_recs)
-                recommendations = books_clean[books_clean['ISBN'].isin(neighbor_isbns)]
-            elif rec_method not in ("🤖 深度学习推荐",):  # 混合推荐
-                if isbn in book_sim_df.columns:
-                    cf_similar = book_sim_df[isbn].sort_values(ascending=False)[1:num_recs*2]
-                    cf_books = books_clean[books_clean['ISBN'].isin(cf_similar.index)]
-                else:
-                    cf_books = pd.DataFrame()
+                        if valid_users and candidate_isbns:
+                            u_idxs, b_idxs, b_isbns = [], [], []
+                            for b_isbn in candidate_isbns:
+                                b_idx = mappings['book_to_idx'][b_isbn]
+                                for u in valid_users:
+                                    u_idxs.append(mappings['user_to_idx'][u])
+                                    b_idxs.append(b_idx)
+                                    b_isbns.append(b_isbn)
 
-                neighbor_isbns = get_content_neighbors(isbn, num_recs * 2)
-                cb_books = books_clean[books_clean['ISBN'].isin(neighbor_isbns)]
+                            with torch.no_grad():
+                                preds = dl_model(
+                                    torch.LongTensor(u_idxs),
+                                    torch.LongTensor(b_idxs)
+                                ).numpy()
 
-                recommendations = pd.concat([cf_books, cb_books]).drop_duplicates(subset='ISBN').head(num_recs)
+                            scores = (
+                                pd.DataFrame({'isbn': b_isbns, 'score': preds})
+                                .groupby('isbn')['score'].mean()
+                                .sort_values(ascending=False)
+                            )
+                            recommendations = books_clean[
+                                books_clean['ISBN'].isin(scores.head(num_recs * 2).index)
+                            ]
+                        else:
+                            st.warning("😅 没有足够的用户数据，已切换为混合推荐")
+                            rec_method = "混合推荐（推荐）"
 
-            # 过滤评分
-            if not recommendations.empty:
-                recommendations = recommendations[
-                    (recommendations['avg_rating'] >= min_rating) |
-                    (recommendations['avg_rating'].isna())
-                ]
+                if rec_method == "基于用户评分" and isbn in book_sim_df.columns:
+                    similar = book_sim_df[isbn].sort_values(ascending=False)[1:num_recs + 1]
+                    recommendations = books_clean[books_clean['ISBN'].isin(similar.index)]
+                elif rec_method == "基于作者风格":
+                    neighbor_isbns = get_content_neighbors(isbn, num_recs)
+                    recommendations = books_clean[books_clean['ISBN'].isin(neighbor_isbns)]
+                elif rec_method not in ("🤖 深度学习推荐",):
+                    if isbn in book_sim_df.columns:
+                        cf_similar = book_sim_df[isbn].sort_values(ascending=False)[1:num_recs * 2]
+                        cf_books = books_clean[books_clean['ISBN'].isin(cf_similar.index)]
+                    else:
+                        cf_books = pd.DataFrame()
 
-            if recommendations.empty:
-                st.warning("😅 没有找到符合条件的推荐，试试降低最低评分要求")
-            else:
-                for idx, row in recommendations.iterrows():
-                    col1, col2 = st.columns([1, 4])
-                    with col1:
-                        if pd.notna(row['Image-URL-M']):
-                            st.image(row['Image-URL-M'], width=100)
-                    with col2:
-                        st.markdown(f"#### 📖 {row['Book-Title']}")
-                        st.write(f"**作者:** {row['Book-Author']}")
-                        if pd.notna(row['avg_rating']):
-                            st.write(f"⭐ {row['avg_rating']:.1f}/10 ({int(row['rating_count'])} 人评价)")
-                    st.markdown("---")
+                    neighbor_isbns = get_content_neighbors(isbn, num_recs * 2)
+                    cb_books = books_clean[books_clean['ISBN'].isin(neighbor_isbns)]
+                    recommendations = pd.concat([cf_books, cb_books]).drop_duplicates(subset='ISBN').head(num_recs)
+
+                if isinstance(recommendations, pd.DataFrame) and not recommendations.empty:
+                    recommendations = recommendations[
+                        (recommendations['avg_rating'] >= min_rating) |
+                        (recommendations['avg_rating'].isna())
+                    ]
+
+                if isinstance(recommendations, pd.DataFrame) and recommendations.empty:
+                    st.warning("😅 没有找到符合条件的推荐，试试降低最低评分要求")
+                elif isinstance(recommendations, pd.DataFrame):
+                    for _, row in recommendations.iterrows():
+                        col1, col2 = st.columns([1, 4])
+                        with col1:
+                            if pd.notna(row['Image-URL-M']):
+                                st.image(row['Image-URL-M'], width=100)
+                        with col2:
+                            st.markdown(f"#### 📖 {row['Book-Title']}")
+                            st.write(f"**作者:** {row['Book-Author']}")
+                            if pd.notna(row['avg_rating']):
+                                st.write(f"⭐ {row['avg_rating']:.1f}/10 ({int(row['rating_count'])} 人评价)")
+                        st.markdown("---")
+
 else:
-    st.info("💡 输入书名或作者开始搜索，系统会为你推荐相似的好书！")
+    st.info("💡 输入中文书名直接搜索（如：明朝那些事、大秦帝国），英文书名走原数据库")
 
-    # 显示热门书籍
-    st.markdown("### 🔥 热门书籍")
+    st.markdown("### 🔥 热门英文书籍")
     popular = books_clean.nlargest(6, 'rating_count', keep='first')
     cols = st.columns(3)
     for i, (_, row) in enumerate(popular.iterrows()):
         with cols[i % 3]:
             if pd.notna(row['Image-URL-M']):
                 st.image(row['Image-URL-M'], width=150)
-            st.write(f"**{row['Book-Title'][:30]}...**" if len(row['Book-Title']) > 30 else f"**{row['Book-Title']}**")
+            title = row['Book-Title']
+            st.write(f"**{title[:30]}...**" if len(title) > 30 else f"**{title}**")
             st.write(f"👤 {row['Book-Author']}")
             if pd.notna(row['avg_rating']):
                 st.write(f"⭐ {row['avg_rating']:.1f}")
