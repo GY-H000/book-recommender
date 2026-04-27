@@ -120,19 +120,9 @@ books_clean, book_sim_df, top_k_neighbors, tfidf, content_matrix, content_books,
 dl_model, mappings = load_dl_model()
 
 
-# ── Google Books API（中文书核心入口）────────────────────────────────────────
+# ── 中文书搜索（Google Books + Open Library 双保险）─────────────────────────
 
-def search_google_books(query, max_results=20):
-    """搜索 Google Books，返回标准化 DataFrame（与英文库字段对齐）。"""
-    try:
-        url = "https://www.googleapis.com/books/v1/volumes"
-        params = {"q": query, "maxResults": max_results, "langRestrict": "zh"}
-        resp = requests.get(url, params=params, timeout=8)
-        resp.raise_for_status()
-        items = resp.json().get("items", [])
-    except Exception:
-        return pd.DataFrame()
-
+def _parse_google_items(items):
     rows = []
     for item in items:
         info = item.get("volumeInfo", {})
@@ -143,32 +133,84 @@ def search_google_books(query, max_results=20):
             "Book-Author": "、".join(info.get("authors", ["未知作者"])),
             "Publisher": info.get("publisher", ""),
             "Year-Of-Publication": str(info.get("publishedDate", ""))[:4],
-            "Image-URL-M": img.get("thumbnail", img.get("smallThumbnail", "")),
+            "Image-URL-M": img.get("thumbnail", img.get("smallThumbnail", "")).replace("http://", "https://"),
             "avg_rating": info.get("averageRating", None),
             "rating_count": info.get("ratingsCount", 0),
             "source": "中文书库",
             "description": info.get("description", ""),
             "categories": "、".join(info.get("categories", [])),
         })
-    return pd.DataFrame(rows)
+    return rows
+
+
+def _search_google(query, max_results=20):
+    url = "https://www.googleapis.com/books/v1/volumes"
+    # 不加 langRestrict，避免美国服务器上过滤掉中文书
+    params = {"q": query, "maxResults": max_results, "printType": "books"}
+    resp = requests.get(url, params=params, timeout=10)
+    resp.raise_for_status()
+    return _parse_google_items(resp.json().get("items", []))
+
+
+def _search_openlibrary(query, max_results=20):
+    url = "https://openlibrary.org/search.json"
+    params = {"q": query, "limit": max_results, "fields": "key,title,author_name,cover_i,first_publish_year,publisher,subject"}
+    resp = requests.get(url, params=params, timeout=10)
+    resp.raise_for_status()
+    docs = resp.json().get("docs", [])
+    rows = []
+    for doc in docs:
+        cover_id = doc.get("cover_i")
+        cover_url = f"https://covers.openlibrary.org/b/id/{cover_id}-M.jpg" if cover_id else ""
+        rows.append({
+            "ISBN": doc.get("key", "").replace("/works/", "OL_"),
+            "Book-Title": doc.get("title", ""),
+            "Book-Author": "、".join(doc.get("author_name", ["未知作者"])[:2]),
+            "Publisher": (doc.get("publisher") or [""])[0],
+            "Year-Of-Publication": str(doc.get("first_publish_year", "")),
+            "Image-URL-M": cover_url,
+            "avg_rating": None,
+            "rating_count": 0,
+            "source": "中文书库",
+            "description": "",
+            "categories": "、".join((doc.get("subject") or [])[:3]),
+        })
+    return rows
+
+
+def search_chinese_books(query, max_results=20):
+    """先试 Google Books，失败则用 Open Library，都失败返回空 DataFrame。"""
+    error_msgs = []
+    try:
+        rows = _search_google(query, max_results)
+        if rows:
+            return pd.DataFrame(rows), None
+    except Exception as e:
+        error_msgs.append(f"Google Books: {e}")
+
+    try:
+        rows = _search_openlibrary(query, max_results)
+        if rows:
+            return pd.DataFrame(rows), None
+    except Exception as e:
+        error_msgs.append(f"Open Library: {e}")
+
+    return pd.DataFrame(), " | ".join(error_msgs)
 
 
 def get_google_books_recommendations(title, author, categories, num=10):
-    """基于书的标题/作者/分类，从 Google Books 找相似中文书。"""
+    """基于书的标题/作者/分类，从网络书库找相似中文书。"""
     results = pd.DataFrame()
 
-    # 先按分类搜
     if categories:
         cat = categories.split("、")[0]
-        df = search_google_books(cat, max_results=15)
+        df, _ = search_chinese_books(cat, max_results=15)
         results = pd.concat([results, df], ignore_index=True)
 
-    # 再按作者搜
     if author and author != "未知作者":
-        df = search_google_books(author, max_results=10)
+        df, _ = search_chinese_books(author, max_results=10)
         results = pd.concat([results, df], ignore_index=True)
 
-    # 去掉自身
     if not results.empty:
         results = results[results['Book-Title'] != title].drop_duplicates(subset='ISBN')
 
@@ -233,10 +275,12 @@ if keyword:
     if is_chinese(keyword_stripped):
         # 中文：直接走 Google Books API
         with st.spinner("🔍 正在搜索中文书库..."):
-            matched_cn = search_google_books(keyword_stripped, max_results=20)
+            matched_cn, err = search_chinese_books(keyword_stripped, max_results=20)
 
         if matched_cn.empty:
-            st.error("😢 没有找到相关中文书籍，试试其他关键词")
+            st.error(f"😢 没有找到相关书籍，试试其他关键词")
+            if err:
+                st.caption(f"调试信息：{err}")
         else:
             st.success(f"在中文书库找到 {len(matched_cn)} 本相关书籍")
             options = matched_cn['Book-Title'].tolist()
