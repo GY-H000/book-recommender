@@ -1,10 +1,28 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import torch
+import torch.nn as nn
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import TfidfVectorizer
 import os
 import pickle
+
+
+class NCF(nn.Module):
+    def __init__(self, n_users, n_books, emb_dim=50):
+        super().__init__()
+        self.user_emb = nn.Embedding(n_users, emb_dim)
+        self.book_emb = nn.Embedding(n_books, emb_dim)
+        self.fc = nn.Sequential(
+            nn.Linear(emb_dim * 2, 128), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(128, 64), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(64, 1), nn.Sigmoid()
+        )
+
+    def forward(self, user, book):
+        x = torch.cat([self.user_emb(user), self.book_emb(book)], dim=1)
+        return self.fc(x).squeeze()
 
 st.set_page_config(page_title="书荒救星", page_icon="📚", layout="wide")
 
@@ -65,26 +83,27 @@ def load_data():
     return books_clean, book_sim_df, content_sim, ratings_clean
 
 @st.cache_resource
-def load_tf_model():
-    if os.path.exists('book_model.keras') and os.path.exists('mappings.pkl'):
-        import tensorflow as tf
-        model = tf.keras.models.load_model('book_model.keras')
+def load_dl_model():
+    if os.path.exists('book_model.pt') and os.path.exists('mappings.pkl'):
         with open('mappings.pkl', 'rb') as f:
             mappings = pickle.load(f)
+        model = NCF(mappings['n_users'], mappings['n_books'])
+        model.load_state_dict(torch.load('book_model.pt', map_location='cpu'))
+        model.eval()
         return model, mappings
     return None, None
 
 books_clean, book_sim_df, content_sim, ratings_clean = load_data()
-tf_model, mappings = load_tf_model()
+dl_model, mappings = load_dl_model()
 
 # 侧边栏 - 个性化选项
 with st.sidebar:
     st.header("🎨 个性化设置")
 
     methods = ["混合推荐（推荐）", "基于用户评分", "基于作者风格"]
-    if tf_model is not None:
+    if dl_model is not None:
         methods.insert(1, "🤖 深度学习推荐")
-        st.success("✅ TensorFlow 模型已加载")
+        st.success("✅ 深度学习模型已加载")
     else:
         st.info("💡 运行 train_model.py 启用深度学习")
 
@@ -161,6 +180,36 @@ if keyword:
             # 推荐逻辑
             recommendations = []
 
+            if rec_method == "🤖 深度学习推荐" and dl_model is not None:
+                if isbn not in mappings['book_to_idx']:
+                    st.warning("😅 该书不在深度学习训练集中，已切换为混合推荐")
+                    rec_method = "混合推荐（推荐）"
+                else:
+                    raters = ratings_clean[
+                        (ratings_clean['ISBN'] == isbn) & (ratings_clean['Book-Rating'] >= 7)
+                    ]['User-ID'].values
+                    valid_users = [u for u in raters[:50] if u in mappings['user_to_idx']]
+                    candidate_isbns = [b for b in list(book_sim_df.columns[:500]) if b != isbn and b in mappings['book_to_idx']]
+
+                    if valid_users and candidate_isbns:
+                        u_idxs, b_idxs, b_isbns = [], [], []
+                        for b_isbn in candidate_isbns:
+                            b_idx = mappings['book_to_idx'][b_isbn]
+                            for u in valid_users:
+                                u_idxs.append(mappings['user_to_idx'][u])
+                                b_idxs.append(b_idx)
+                                b_isbns.append(b_isbn)
+
+                        with torch.no_grad():
+                            preds = dl_model(torch.LongTensor(u_idxs), torch.LongTensor(b_idxs)).numpy()
+
+                        scores = pd.DataFrame({'isbn': b_isbns, 'score': preds}) \
+                            .groupby('isbn')['score'].mean().sort_values(ascending=False)
+                        recommendations = books_clean[books_clean['ISBN'].isin(scores.head(num_recs * 2).index)]
+                    else:
+                        st.warning("😅 没有足够的用户数据，已切换为混合推荐")
+                        rec_method = "混合推荐（推荐）"
+
             if rec_method == "基于用户评分" and isbn in book_sim_df.columns:
                 similar = book_sim_df[isbn].sort_values(ascending=False)[1:num_recs+1]
                 recommendations = books_clean[books_clean['ISBN'].isin(similar.index)]
@@ -168,7 +217,7 @@ if keyword:
                 book_idx = books_clean[books_clean['ISBN'] == isbn].index[0]
                 similar_idx = np.argsort(content_sim[book_idx])[::-1][1:num_recs+1]
                 recommendations = books_clean.iloc[similar_idx]
-            else:  # 混合推荐
+            elif rec_method not in ("🤖 深度学习推荐",):  # 混合推荐
                 if isbn in book_sim_df.columns:
                     cf_similar = book_sim_df[isbn].sort_values(ascending=False)[1:num_recs*2]
                     cf_books = books_clean[books_clean['ISBN'].isin(cf_similar.index)]
