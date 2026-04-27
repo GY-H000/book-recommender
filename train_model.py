@@ -100,4 +100,4 @@ with open('mappings.pkl', 'wb') as f:
         'n_books': len(book_ids)
     }, f)
 
-print("✅ 训练完成！运行 streamlit run app.py 启动推荐系统")
+print("训练完成！运行 streamlit run app.py 启动推荐系统")

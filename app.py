@@ -74,13 +74,29 @@ def load_data():
         columns=book_matrix.columns
     )
 
-    # 基于内容的相似度（作者+出版社）
-    books_clean['content'] = books_clean['Book-Author'].fillna('') + ' ' + books_clean['Publisher'].fillna('')
+    # 基于内容的相似度（作者+出版社）- 只对有足够评分的书计算，避免OOM
+    content_books = books_clean[books_clean['rating_count'] >= 5].reset_index(drop=True)
+    content_books['content'] = content_books['Book-Author'].fillna('') + ' ' + content_books['Publisher'].fillna('')
     tfidf = TfidfVectorizer(max_features=500)
-    content_matrix = tfidf.fit_transform(books_clean['content'])
-    content_sim = cosine_similarity(content_matrix)
+    content_matrix = tfidf.fit_transform(content_books['content'])
 
-    return books_clean, book_sim_df, content_sim, ratings_clean
+    # 只存 top-K 邻居，避免存储完整 NxN 矩阵（271356^2 = 589GB）
+    K = 50
+    isbn_arr = content_books['ISBN'].values
+    top_k_neighbors = {}
+    n = len(content_books)
+    batch_size = 500
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        sims = cosine_similarity(content_matrix[start:end], content_matrix)
+        for i, row_sims in enumerate(sims):
+            global_idx = start + i
+            top_idx = np.argpartition(row_sims, -(K + 1))[-(K + 1):]
+            top_idx = top_idx[top_idx != global_idx]
+            top_idx = top_idx[np.argsort(row_sims[top_idx])[::-1]][:K]
+            top_k_neighbors[isbn_arr[global_idx]] = isbn_arr[top_idx].tolist()
+
+    return books_clean, book_sim_df, top_k_neighbors, tfidf, content_matrix, content_books, ratings_clean
 
 @st.cache_resource
 def load_dl_model():
@@ -93,8 +109,22 @@ def load_dl_model():
         return model, mappings
     return None, None
 
-books_clean, book_sim_df, content_sim, ratings_clean = load_data()
+books_clean, book_sim_df, top_k_neighbors, tfidf, content_matrix, content_books, ratings_clean = load_data()
 dl_model, mappings = load_dl_model()
+
+def get_content_neighbors(isbn, num):
+    """返回基于内容相似度的邻居 ISBN 列表。"""
+    if isbn in top_k_neighbors:
+        return top_k_neighbors[isbn][:num]
+    # 对不在预计算集合中的书，实时计算（<2ms）
+    row = books_clean[books_clean['ISBN'] == isbn]
+    if row.empty:
+        return []
+    content = row.iloc[0]['Book-Author'] + ' ' + row.iloc[0]['Publisher']
+    vec = tfidf.transform([content])
+    sims = cosine_similarity(vec, content_matrix)[0]
+    top_idx = np.argsort(sims)[::-1][:num]
+    return content_books.iloc[top_idx]['ISBN'].tolist()
 
 # 侧边栏 - 个性化选项
 with st.sidebar:
@@ -214,9 +244,8 @@ if keyword:
                 similar = book_sim_df[isbn].sort_values(ascending=False)[1:num_recs+1]
                 recommendations = books_clean[books_clean['ISBN'].isin(similar.index)]
             elif rec_method == "基于作者风格":
-                book_idx = books_clean[books_clean['ISBN'] == isbn].index[0]
-                similar_idx = np.argsort(content_sim[book_idx])[::-1][1:num_recs+1]
-                recommendations = books_clean.iloc[similar_idx]
+                neighbor_isbns = get_content_neighbors(isbn, num_recs)
+                recommendations = books_clean[books_clean['ISBN'].isin(neighbor_isbns)]
             elif rec_method not in ("🤖 深度学习推荐",):  # 混合推荐
                 if isbn in book_sim_df.columns:
                     cf_similar = book_sim_df[isbn].sort_values(ascending=False)[1:num_recs*2]
@@ -224,11 +253,10 @@ if keyword:
                 else:
                     cf_books = pd.DataFrame()
 
-                book_idx = books_clean[books_clean['ISBN'] == isbn].index[0]
-                similar_idx = np.argsort(content_sim[book_idx])[::-1][1:num_recs*2]
-                content_books = books_clean.iloc[similar_idx]
+                neighbor_isbns = get_content_neighbors(isbn, num_recs * 2)
+                cb_books = books_clean[books_clean['ISBN'].isin(neighbor_isbns)]
 
-                recommendations = pd.concat([cf_books, content_books]).drop_duplicates(subset='ISBN').head(num_recs)
+                recommendations = pd.concat([cf_books, cb_books]).drop_duplicates(subset='ISBN').head(num_recs)
 
             # 过滤评分
             if not recommendations.empty:
