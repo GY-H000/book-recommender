@@ -140,10 +140,7 @@ def _search_google_books(query, max_results=10):
         api_key = st.secrets["GOOGLE_BOOKS_API_KEY"]
     except Exception:
         return []
-    if not api_key:
-        return []
-    from urllib.parse import quote
-    url = f"https://www.googleapis.com/books/v1/volumes?q={quote(query)}&maxResults={max_results}&key={api_key}"
+    url = f"https://www.googleapis.com/books/v1/volumes?q={query}&maxResults={max_results}&key={api_key}"
     try:
         resp = requests.get(url, timeout=10)
         resp.raise_for_status()
