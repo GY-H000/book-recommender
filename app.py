@@ -7,7 +7,6 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import TfidfVectorizer
 import os
 import pickle
-import requests
 
 
 class NCF(nn.Module):
@@ -135,60 +134,16 @@ def load_cn_books():
 
 BUILTIN_CN_BOOKS = load_cn_books()
 
-def _search_openlibrary(query, max_results=15):
-    url = "https://openlibrary.org/search.json"
-    params = {"q": query, "limit": max_results,
-              "fields": "key,title,author_name,cover_i,first_publish_year,publisher,subject"}
-    resp = requests.get(url, params=params, timeout=10)
-    resp.raise_for_status()
-    docs = resp.json().get("docs", [])
-    rows = []
-    for doc in docs:
-        cover_id = doc.get("cover_i")
-        cover_url = f"https://covers.openlibrary.org/b/id/{cover_id}-M.jpg" if cover_id else ""
-        rows.append({
-            "ISBN": doc.get("key", "").replace("/works/", "OL_"),
-            "Book-Title": doc.get("title", ""),
-            "Book-Author": "、".join(doc.get("author_name", ["未知作者"])[:2]),
-            "Publisher": (doc.get("publisher") or [""])[0],
-            "Year-Of-Publication": str(doc.get("first_publish_year", "")),
-            "Image-URL-M": cover_url,
-            "avg_rating": None,
-            "rating_count": 0,
-            "source": "中文书库",
-            "description": "",
-            "categories": "、".join((doc.get("subject") or [])[:3]),
-        })
-    return rows
-
-
 def search_chinese_books(query, max_results=20):
-    """先搜内置中文书库，再补充 Open Library 结果。"""
-    q = query.strip().lower()
-
-    # 内置库模糊匹配（书名 or 作者 or 分类）
     mask = (
         BUILTIN_CN_BOOKS['Book-Title'].str.contains(query, case=False, na=False) |
         BUILTIN_CN_BOOKS['Book-Author'].str.contains(query, case=False, na=False) |
         BUILTIN_CN_BOOKS['categories'].str.contains(query, case=False, na=False)
     )
-    builtin_results = BUILTIN_CN_BOOKS[mask].copy()
-
-    # Open Library 补充（出错也不影响内置结果）
-    ol_results = pd.DataFrame()
-    try:
-        rows = _search_openlibrary(query, max_results=15)
-        if rows:
-            ol_results = pd.DataFrame(rows)
-    except Exception:
-        pass
-
-    combined = pd.concat([builtin_results, ol_results], ignore_index=True)
-    combined = combined.drop_duplicates(subset='Book-Title')
-
-    if combined.empty:
-        return pd.DataFrame(), f"内置书库和 Open Library 均未找到"{query}""
-    return combined.head(max_results), None
+    results = BUILTIN_CN_BOOKS[mask].copy()
+    if results.empty:
+        return pd.DataFrame(), f"书库中未找到"{query}"，试试其他关键词"
+    return results.head(max_results), None
 
 
 def get_google_books_recommendations(title, author, categories, num=10):
