@@ -135,15 +135,17 @@ def load_cn_books():
 
 BUILTIN_CN_BOOKS = load_cn_books()
 
-_GOOGLE_BOOKS_API_KEY = st.secrets.get("GOOGLE_BOOKS_API_KEY", "")
-
 def _search_google_books(query, max_results=10):
-    if not _GOOGLE_BOOKS_API_KEY:
-        return []
-    url = "https://www.googleapis.com/books/v1/volumes"
-    params = {"q": query, "maxResults": max_results, "key": _GOOGLE_BOOKS_API_KEY}
     try:
-        resp = requests.get(url, params=params, timeout=10)
+        api_key = st.secrets["GOOGLE_BOOKS_API_KEY"]
+    except Exception:
+        return []
+    if not api_key:
+        return []
+    from urllib.parse import quote
+    url = f"https://www.googleapis.com/books/v1/volumes?q={quote(query)}&maxResults={max_results}&key={api_key}"
+    try:
+        resp = requests.get(url, timeout=10)
         resp.raise_for_status()
     except Exception:
         return []
