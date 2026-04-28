@@ -7,6 +7,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import TfidfVectorizer
 import os
 import pickle
+import requests
 
 
 class NCF(nn.Module):
@@ -134,16 +135,60 @@ def load_cn_books():
 
 BUILTIN_CN_BOOKS = load_cn_books()
 
+_GOOGLE_BOOKS_API_KEY = st.secrets.get("GOOGLE_BOOKS_API_KEY", "")
+
+def _search_google_books(query, max_results=10):
+    if not _GOOGLE_BOOKS_API_KEY:
+        return []
+    url = "https://www.googleapis.com/books/v1/volumes"
+    params = {"q": query, "maxResults": max_results, "key": _GOOGLE_BOOKS_API_KEY}
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+    except Exception:
+        return []
+    rows = []
+    for item in resp.json().get("items", []):
+        info = item.get("volumeInfo", {})
+        isbn = item.get("id", "GB_" + info.get("title", "")[:8])
+        cover = (info.get("imageLinks") or {}).get("thumbnail", "")
+        rows.append({
+            "ISBN": isbn,
+            "Book-Title": info.get("title", ""),
+            "Book-Author": "、".join((info.get("authors") or ["未知作者"])[:2]),
+            "Publisher": info.get("publisher", ""),
+            "Year-Of-Publication": str(info.get("publishedDate", ""))[:4],
+            "Image-URL-M": cover,
+            "avg_rating": None,
+            "rating_count": 0,
+            "source": "Google Books",
+            "description": info.get("description", "")[:200],
+            "categories": "、".join((info.get("categories") or [])[:2]),
+        })
+    return rows
+
+
 def search_chinese_books(query, max_results=20):
     mask = (
         BUILTIN_CN_BOOKS['Book-Title'].str.contains(query, case=False, na=False) |
         BUILTIN_CN_BOOKS['Book-Author'].str.contains(query, case=False, na=False) |
         BUILTIN_CN_BOOKS['categories'].str.contains(query, case=False, na=False)
     )
-    results = BUILTIN_CN_BOOKS[mask].copy()
-    if results.empty:
+    builtin_results = BUILTIN_CN_BOOKS[mask].copy()
+
+    # 若 CSV 结果不足 5 条，用 Google Books 补充
+    gb_results = pd.DataFrame()
+    if len(builtin_results) < 5:
+        rows = _search_google_books(query, max_results=10)
+        if rows:
+            gb_results = pd.DataFrame(rows)
+
+    combined = pd.concat([builtin_results, gb_results], ignore_index=True)
+    combined = combined.drop_duplicates(subset='Book-Title')
+
+    if combined.empty:
         return pd.DataFrame(), f"书库中未找到\"{query}\"，试试其他关键词"
-    return results.head(max_results), None
+    return combined.head(max_results), None
 
 
 def get_google_books_recommendations(title, author, categories, num=10):
