@@ -142,7 +142,7 @@ def search_chinese_books(query, max_results=20):
     )
     results = BUILTIN_CN_BOOKS[mask].copy()
     if results.empty:
-        return pd.DataFrame(), f"书库中未找到"{query}"，试试其他关键词"
+        return pd.DataFrame(), f"书库中未找到\"{query}\"，试试其他关键词"
     return results.head(max_results), None
 
 
